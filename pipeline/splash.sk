@@ -1,0 +1,232 @@
+#from snakemake.utils import report
+
+# simulate a bash login shell, see https://bitbucket.org/johanneskoester/snakemake/wiki/FAQ
+shell.executable("/bin/bash")
+
+# "unofficial bash strict mode" http://www.redsymbol.net/articles/unofficial-bash-strict-mode/
+shell.prefix("source ~/.bashrc; set -euo pipefail;")
+
+
+rule final:
+	input:  "fastqc.complete",
+		"finalResult.txt"
+		#config['REF_FA_ID'] + ".chimera-flt-no-junc.rrna.intra.eval.csv",
+		#config['REF_FA_ID'] + ".chimera-flt-no-junc.rrna.eval.plot.intra.pdf"
+		
+	message: 'This is the end. My only friend, the end'
+
+def get_fq_base(r):
+	import glob
+	return sorted(glob.glob("*_R{}[_.]*fastq.gz".format(r)))
+
+rule split_fq:
+	# this only works if get_fq_base produces the same as the glob in SPLIT_WRAPPER
+	# and the output here matches exactly the SPLIT_WRAPPER output
+	input:  fqi=get_fq_base("1"), fqj=get_fq_base("2")
+	output: temp(expand("R{r}.split-{i:06d}.fastq.gz", r=[1, 2], i=range(1, int(config["NUM_SPLITS"])+1)))
+	params: num_split=config["NUM_SPLITS"]
+	threads: 16
+	shell: 
+		#'{config[SPLIT_WRAPPER]} {params.num_split}'
+		"""
+			bash {config[SPLIT_WRAPPER]} {input.fqi} ./ R1.split- {params.num_split} {threads}
+			bash {config[SPLIT_WRAPPER]} {input.fqj} ./ R2.split- {params.num_split} {threads}
+		"""
+
+rule cutadpt:
+	input: 
+		fqi = "R1.{group}.fastq.gz",
+		fqj = "R2.{group}.fastq.gz"
+	output: 
+		trimseq1 = temp("R1.{group}.trim.fastq"),
+		trimseq2 = temp("R2.{group}.trim.fastq"),
+		#cut3end1 = temp("R1.{group}.cut.fastq.gz"),
+		trimlog = "read.trim.{group}.log"
+	params:
+		adp1=config["ADAPTER"]["A"],adp2=config["ADAPTER"]["B"],threecutbase=config["THREECUTBASE"],fivecutbase=config["FIVECUTBASE"]
+	threads: 16
+	shell:
+			#{config[CUTADPT]} -a AP1={params.adp1} --discard-untrimmed --max-n=2 -n 1 -O 8 -m 20 -o {output.trimseq1} {input.fqi} > {output.trimlog}
+			#zcat {input.fqi} | sh {config[TRIMSEQ]} {params.fivecutbase} {params.threecutbase} | pigz -p {threads} -c > {output.cut3end1}
+			#bash {config[CUTADPT]} {output.cut3end1} {output.trimseq1} {params.adp1} {params.adp2} {threads} {output.trimlog}
+		"""
+			TRIM3PR1={params.threecutbase} TRIM3PR2={params.threecutbase} GZFQ=no TRIM5P=20 THREADS=8 time bash {config[CUTADPTPE]} {input.fqi} {input.fqj} {output.trimseq1} {output.trimseq2} {params.adp1} {params.adp2} {output.trimlog}
+		"""
+
+rule mergepairs:
+	input: fqi = "R1.{group}.trim.fastq", fqj = "R2.{group}.trim.fastq"
+	output:
+		merged = temp("merged.{group}.fix.fastq.gz")
+	threads: 8
+	shell:
+		"""
+			{config[USEARCH]} -fastq_mergepairs {input.fqi} -reverse {input.fqj} -fastqout /dev/stdout -fastq_merge_maxee 3  -fastq_minmergelen 30  -fastq_minlen 30 -threads {threads} | pigz -p {threads} -c > {output.merged}
+		"""
+
+rule extractBarcode:
+	input:
+		merged = "merged.{group}.fix.fastq"
+	output:
+		barcode = temp("barcode.{group}.txt"),
+		trimseq = temp("merged.{group}.trim.fastq")
+	shell:
+		"""
+			cat {input.merged} | sh {config[EXTRACTBARCODE]} {output.barcode} > {output.trimseq}
+
+		"""
+
+rule join_fq:
+	input: 
+		merged=expand("merged.split-{i:06d}.fix.fastq.gz", i=range(1, int(config["NUM_SPLITS"])+1)),
+	output: 
+		merged="merged.all.fastq.gz"
+	threads: 8
+	shell: 
+		"""
+			cat {input.merged} > {output.merged}
+		"""
+
+rule fastqc_merged:
+	input: rules.join_fq.output.merged
+	output: "fastqc.complete"
+	threads: 16 
+	shell: "{config[FASTQC]} -t {threads} {input} && touch {output}"
+
+rule map:
+	input: fq=rules.join_fq.output.merged, reffa=config['REF_FA']
+	output: bam=config['REF_FA_ID'] + ".bam"
+	threads: 16 
+	#benchmark: "bwa-time.json"	
+	params: T="20"
+	shell: '{config[BWA]} mem -t {threads} -T {params.T} {input.reffa} {input.fq} | {config[SAMTOOLS]} view -bS - | {config[SAMTOOLS]} sort - {config[REF_FA_ID]}'
+
+#rule remdups:
+#	input: bam = rules.map.output.bam, mapid = "mapid.txt", barcode = rules.join_fq.output.barcode
+#	output: bam = config['REF_FA_ID'] + ".dupsrem.bam", log = config['REF_FA_ID'] + ".dupsrem.log"
+#	threads: 8
+#	shell:
+#		"""
+#			bash {config[REMDUPSMAWK]} {input.bam} {output.bam} {input.mapid} {input.barcode} {threads} 2>{output.log} 1>&2
+#
+#		"""
+
+
+rule remdups:
+	input: bam=rules.map.output.bam
+	output: bam=config['REF_FA_ID'] + ".dupsrem.bam", log=config['REF_FA_ID'] + ".dupsrem.log"
+	shell: "{config[REMDUPS]} {input.bam} {output.bam} 2>{output.log} 1>&2"
+
+rule index:
+	input: remdups=rules.remdups.output.bam, noremdups=rules.map.output.bam
+	output: remdupsbai=rules.remdups.output.bam + ".bai", noremdupsbai=rules.map.output.bam + ".bai"
+	shell: 
+		"""
+			{config[SAMTOOLS]} index {input.remdups}
+			{config[SAMTOOLS]} index {input.noremdups}
+		"""
+
+rule find_chimeras:
+	input: bam=rules.remdups.output.bam, bai=rules.remdups.output.bam + ".bai"
+	#input: bam=rules.map.output.bam, bai=rules.map.output.bam + ".bai"
+	output: chim=config['REF_FA_ID'] + ".chimera-raw.csv"
+	shell: "{config[FIND_CHIMERAS]} -i {input.bam} -o {output.chim}"
+
+# FIXME likely obsolete as of 2015-10-27
+rule split_chimeras:
+	input: rules.find_chimeras.output.chim
+	output: intra=config['REF_FA_ID'] + ".chimera-raw.intra.csv",
+	        intra_rrna=config['REF_FA_ID'] + ".chimera-raw.rrna.intra.csv",
+		    inter=config['REF_FA_ID'] + ".chimera-raw.inter.csv",
+		    inter_rrna=config['REF_FA_ID'] + ".chimera-raw.rrna.inter.csv",
+	shell: "{config[SPLIT_CHIMERAS]} --input {input[0]} --intra {output.intra} --intra-rrna {output.intra_rrna} --inter {output.inter} --inter-rrna {output.inter_rrna}"
+
+rule eval_rrna:
+	input: intra=rules.split_chimeras.output.intra_rrna, inter=rules.split_chimeras.output.inter_rrna
+	output: intra=config['REF_FA_ID'] + ".chimera-raw.rrna.intra.eval.csv",
+			inter=config['REF_FA_ID'] + ".chimera-raw.rrna.inter.eval.csv",
+	shell: "{config[EVAL_RRNA]} {input.intra} {output.intra}; {config[EVAL_RRNA]} {input.inter} {output.inter};"
+
+rule plot_rrna_eval:
+	input: intra=rules.eval_rrna.output.intra, inter=rules.eval_rrna.output.inter,
+	params: outpref=config['REF_FA_ID'] + ".chimera-raw.rrna.eval.plot"
+	output: expand(config['REF_FA_ID'] + ".chimera-raw.rrna.eval.plot" + ".{ext}", ext=["intra.pdf", "inter.pdf"])
+	# shell: "{config[PLOT_RRNA_RANK]} -i <(cat {input.intra} {input.intra}) -p {params.outpref}"
+	shell: "{config[PLOT_RRNA_RANK]} -i {input.intra} {input.inter} -p {params.outpref} > {params.outpref}.log"
+
+# new as of 2015-10-27
+rule filter_chimeras:
+	input: chim=config['REF_FA_ID'] + ".chimera-raw.csv"
+	output: chim=config['REF_FA_ID'] + ".chimera-flt.csv"
+	params: minmq="20"
+	shell: "{config[FILTER_CHIMERAS]} -i {input.chim} -o {output.chim} --min-mq {params.minmq}"
+
+rule chimeras_to_fastq:
+	input: chimflt=config['REF_FA_ID'] + ".chimera-flt.csv"
+	output: fastq=config['REF_FA_ID'] + ".chimera-flt.fastq.gz"
+	shell: "{config[CHIM2FQ]} -i {input.chimflt} | gzip > {output.fastq}"
+
+rule map_to_genome:
+	input: fastq=config['REF_FA_ID'] + ".chimera-flt.fastq.gz", reffa=config['GENOME_REF_FA']
+	output: bam=config['REF_FA_ID'] + ".chimera-flt.genome.bam"
+	threads: 8
+	params: T="20"
+	# same parameters as in first round; do not sort, chimeras should come together
+	shell: '{config[BWA]} mem -t {threads} -T {params.T} {input.reffa} {input.fastq} | samtools view -bS -F 0x900 -o {output.bam} -'
+
+rule extract_and_subtract_junction_reads:
+	input: bam=config['REF_FA_ID'] + ".chimera-flt.genome.bam",
+		   junction_intron_bed=config['JUNCTION_INTRON_BED'],
+		   chim_flt=config['REF_FA_ID'] + ".chimera-flt.csv"
+	output: junct_ids=config['REF_FA_ID'] + ".chimera-flt.genome.junction-ids.txt.gz",
+			chim_nojunct=config['REF_FA_ID'] + ".chimera-flt-no-junc.csv"
+	shell:	"""
+			samtools view -h -F 4 {input.bam} | \
+			  {config[READSFORSJDBINTRON]} | grep -v chrUn | \
+			  bedtools intersect -a - -b {input.junction_intron_bed} -F 0.95 -f 0.95 -loj | \
+			  awk '{{if($7!="."){{match($4,"(.*)-(.*)",a);print a[1];}}}}' | uniq | gzip > {output.junct_ids};
+			samtools view -f 0x4 {input.bam} | cut -f 1 | sed -e 's,-[LR],,' | uniq | gzip >> {output.junct_ids};
+			join -v 1 -t $'\\t' <(sort -k1,1 {input.chim_flt}) <(zcat {output.junct_ids} | sort) > {output.chim_nojunct}
+			"""
+# $'\t' : ANSI-C quoting
+# gzip >> : Because two gzipped files concatenated together is a valid gzip file
+
+# genome_bed=config['REF_FA_ID'] + ".chimera-flt.genome.bed.gz",
+#bamToBed -i {input.bam} | gzip > {output.genome_bed};
+#		   zcat {output.genome_bed} | \
+#				awk '{{OFS="\\t"}} {{print $1,$3-5,$3+5,$4,$5,$6; print $1,$2-5,$2+5,$4,$5,$6;}}' | \
+#					bedtools intersect -a - -b {input.junction_bed} -loj | awk '{{if ($7!=".") {{print $4}}}}' | \
+#						sed -e 's,-[LR]$,,' | uniq | gzip > {output.junct_ids};
+
+rule finalResult:
+	input:
+		rules.extract_and_subtract_junction_reads.output.chim_nojunct
+	output:
+		"finalResult.txt"
+	shell:
+		"""
+			perl {config[SUMRESULT]} {input} no > {output}
+		"""
+
+rule split_chimeras_nojunc:
+	input: rules.extract_and_subtract_junction_reads.output.chim_nojunct
+	output: intra=config['REF_FA_ID'] + ".chimera-flt-no-junc.intra.csv",
+			intra_rrna=config['REF_FA_ID'] + ".chimera-flt-no-junc.rrna.intra.csv",
+			inter=config['REF_FA_ID'] + ".chimera-flt-no-junc.inter.csv",
+			inter_rrna=config['REF_FA_ID'] + ".chimera-flt-no-junc.rrna.inter.csv",
+	shell: "{config[SPLIT_CHIMERAS]} --input {input[0]} --intra {output.intra} --intra-rrna {output.intra_rrna} --inter {output.inter} --inter-rrna {output.inter_rrna}"
+
+rule eval_rrna_nojunc:
+	input: intra=config['REF_FA_ID'] + ".chimera-flt-no-junc.rrna.intra.csv",
+		   inter=config['REF_FA_ID'] + ".chimera-flt-no-junc.rrna.inter.csv",
+	output: intra=config['REF_FA_ID'] + ".chimera-flt-no-junc.rrna.intra.eval.csv",
+			inter=config['REF_FA_ID'] + ".chimera-flt-no-junc.rrna.inter.eval.csv",
+	shell: "{config[EVAL_RRNA]} {input.intra} {output.intra}; {config[EVAL_RRNA]} {input.inter} {output.inter};"
+
+rule plot_rrna_eval_nojunc:
+	input: intra=rules.eval_rrna_nojunc.output.intra, inter=rules.eval_rrna_nojunc.output.inter,
+	params: outpref=config['REF_FA_ID'] + ".chimera-flt-no-junc.rrna.eval.plot"
+	output: expand(config['REF_FA_ID'] + ".chimera-flt-no-junc.rrna.eval.plot" + ".{ext}", ext=["intra.pdf", "inter.pdf"])
+	# shell: "{config[PLOT_RRNA_RANK]} -i <(cat {input.intra} {input.intra}) -p {params.outpref}"
+	shell: "{config[PLOT_RRNA_RANK]} -i {input.intra} {input.inter} -p {params.outpref} > {params.outpref}.log"
+
+
